@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "com.autoboost.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "MinecraftClientMixin",
+    "EntityRendererMixin",
+    "ExplosionPacketMixin",
+    "ParticleManagerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
