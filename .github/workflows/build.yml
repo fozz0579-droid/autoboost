@@ -1,1 +1,442 @@
+name: Build AutoBoost
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kaynak dosyalari olustur
+        run: |
+          set -e
+          rm -rf src build.gradle gradle.properties settings.gradle
+          mkdir -p .
+          cat > build.gradle <<'AB_EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = 'com.autoboost'
+          base { archivesName = 'autoboost' }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          AB_EOF
+          mkdir -p .
+          cat > gradle.properties <<'AB_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          # Güncel değerleri https://fabricmc.net/develop adresinden kontrol et
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.3
+          loader_version=0.18.1
+          fabric_version=0.139.4+1.21.11
+          mod_version=1.1.0
+          AB_EOF
+          mkdir -p .
+          cat > settings.gradle <<'AB_EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          AB_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'AB_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "autoboost",
+            "version": "${version}",
+            "name": "AutoBoost",
+            "description": "Grafiklere dokunmadan otomatik FPS optimizasyonu, patlama koruması ve sınırsız FPS.",
+            "authors": ["You"],
+            "environment": "client",
+            "entrypoints": { "client": ["com.autoboost.AutoBoostMod"] },
+            "mixins": ["autoboost.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          AB_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/autoboost.mixins.json <<'AB_EOF'
+          {
+            "required": true,
+            "package": "com.autoboost.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": [
+              "MinecraftClientMixin",
+              "EntityRendererMixin",
+              "ExplosionPacketMixin",
+              "ParticleManagerMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 0
+            }
+          }
+          AB_EOF
+          mkdir -p src/main/java/com/autoboost
+          cat > src/main/java/com/autoboost/AutoBoostMod.java <<'AB_EOF'
+          package com.autoboost;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.util.Identifier;
+          import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.Screens;
+          import net.minecraft.client.gui.screen.TitleScreen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.ClickableWidget;
+          import net.minecraft.text.Text;
+          import net.minecraft.text.TranslatableTextContent;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class AutoBoostMod implements ClientModInitializer {
+              public static final Logger LOGGER = LoggerFactory.getLogger("autoboost");
+
+              @Override
+              public void onInitializeClient() {
+                  BoostConfig.load();
+                  Optimizer.init();
+
+                  // Ekranda FPS + saniye başı değişim göstergesi
+                  try {
+                      HudElementRegistry.attachElementBefore(VanillaHudElements.CHAT,
+                              Identifier.of("autoboost", "fps_hud"), (ctx, tick) -> {
+                                  try {
+                                      BoostConfig c = BoostConfig.get();
+                                      MinecraftClient mc = MinecraftClient.getInstance();
+                                      if (!c.enabled || !c.showFpsHud || mc.options.hudHidden) return;
+                                      int d = Optimizer.fpsDelta;
+                                      String txt = "FPS " + Optimizer.fpsNow + " (" + (d >= 0 ? "+" : "") + d + "/sn)";
+                                      int color = d >= 0 ? 0xFF55FF55 : 0xFFFF5555;
+                                      ctx.drawTextWithShadow(mc.textRenderer, txt, 4, 4, color);
+                                  } catch (Throwable ignored) { }
+                              });
+                  } catch (Throwable t) {
+                      LOGGER.error("FPS göstergesi eklenemedi", t);
+                  }
+
+                  // "Çoklu Oyuncu" butonunun altına ayar butonu ekle
+                  ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+                      if (!(screen instanceof TitleScreen)) return;
+                      try {
+                          List<ClickableWidget> buttons = Screens.getButtons(screen);
+                          ClickableWidget multiplayer = null;
+                          for (ClickableWidget b : buttons) {
+                              if (b.getMessage().getContent() instanceof TranslatableTextContent t
+                                      && t.getKey().equals("menu.multiplayer")) {
+                                  multiplayer = b;
+                                  break;
+                              }
+                          }
+                          if (multiplayer == null) return;
+
+                          int gap = 24;
+                          int baseY = multiplayer.getY();
+                          for (ClickableWidget b : new ArrayList<>(buttons)) {
+                              if (b != multiplayer && b.getY() > baseY) b.setY(b.getY() + gap);
+                          }
+
+                          ButtonWidget btn = ButtonWidget.builder(Text.literal("AutoBoost Ayarları"),
+                                          x -> client.setScreen(new BoostConfigScreen(screen)))
+                                  .dimensions(multiplayer.getX(), baseY + gap, multiplayer.getWidth(), 20)
+                                  .build();
+                          buttons.add(btn);
+                      } catch (Throwable t) {
+                          LOGGER.error("Ayar butonu eklenemedi", t);
+                      }
+                  });
+              }
+          }
+          AB_EOF
+          mkdir -p src/main/java/com/autoboost
+          cat > src/main/java/com/autoboost/BoostConfig.java <<'AB_EOF'
+          package com.autoboost;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+
+          public class BoostConfig {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Path PATH = FabricLoader.getInstance().getConfigDir().resolve("autoboost.json");
+              private static BoostConfig instance = new BoostConfig();
+
+              public boolean enabled = true;          // Ana şalter
+              public boolean autoMode = true;         // Hedef FPS'i otomatik belirle
+              public boolean unlimitedFps = true;     // FPS sınırını kaldır (1000 FPS için)
+              public boolean explosionBoost = true;   // Patlamada (TNT/kristal) otomatik FPS koruması
+              public boolean showFpsHud = true;       // Ekranda FPS ve saniye başı değişim
+              public boolean backgroundLimit = true;  // Pencere odakta değilken FPS sınırı
+              public int backgroundFps = 15;
+              public boolean entityCulling = true;    // FPS düşünce uzak eşya/XP/TNT/kristal çizimini atla
+              public int targetFps = 60;
+              public boolean memoryGuard = true;      // Bellek dolunca arka planda temizlik
+
+              public static BoostConfig get() { return instance; }
+
+              public static void load() {
+                  try {
+                      if (Files.exists(PATH)) {
+                          BoostConfig c = GSON.fromJson(Files.readString(PATH), BoostConfig.class);
+                          if (c != null) instance = c;
+                      }
+                      instance.targetFps = Math.max(20, Math.min(1000, instance.targetFps));
+                      instance.backgroundFps = Math.max(5, Math.min(60, instance.backgroundFps));
+                  } catch (Throwable t) {
+                      instance = new BoostConfig(); // bozuk dosya oyunu çökertmesin
+                  }
+                  save();
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(PATH, GSON.toJson(instance));
+                  } catch (Throwable ignored) { }
+              }
+          }
+          AB_EOF
+          mkdir -p src/main/java/com/autoboost
+          cat > src/main/java/com/autoboost/BoostConfigScreen.java <<'AB_EOF'
+          package com.autoboost;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.function.BooleanSupplier;
+          import java.util.function.Consumer;
+
+          public class BoostConfigScreen extends Screen {
+              private static final int[] FPS_STEPS = {30, 45, 60, 90, 120, 144, 240, 360, 500, 1000};
+              private static final int W = 150;
+              private final Screen parent;
+
+              public BoostConfigScreen(Screen parent) {
+                  super(Text.literal("AutoBoost Ayarları"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  BoostConfig c = BoostConfig.get();
+                  int xl = this.width / 2 - W - 5;
+                  int xr = this.width / 2 + 5;
+                  int y = Math.max(40, this.height / 6);
+
+                  toggle(xl, y, "Mod", () -> c.enabled, v -> c.enabled = v);
+                  toggle(xr, y, "Sınırsız FPS", () -> c.unlimitedFps, v -> c.unlimitedFps = v);
+                  toggle(xl, y + 24, "Otomatik mod", () -> c.autoMode, v -> c.autoMode = v);
+                  toggle(xr, y + 24, "Patlama koruması", () -> c.explosionBoost, v -> c.explosionBoost = v);
+                  toggle(xl, y + 48, "FPS göstergesi", () -> c.showFpsHud, v -> c.showFpsHud = v);
+                  toggle(xr, y + 48, "Eşya/TNT/XP kırpma", () -> c.entityCulling, v -> c.entityCulling = v);
+                  toggle(xl, y + 72, "Arka plan sınırı", () -> c.backgroundLimit, v -> c.backgroundLimit = v);
+                  toggle(xr, y + 72, "Bellek koruması", () -> c.memoryGuard, v -> c.memoryGuard = v);
+
+                  this.addDrawableChild(ButtonWidget.builder(fpsLabel(c), btn -> {
+                      int next = FPS_STEPS[0];
+                      for (int s : FPS_STEPS) {
+                          if (s > c.targetFps) { next = s; break; }
+                      }
+                      c.targetFps = next;
+                      btn.setMessage(fpsLabel(c));
+                      BoostConfig.save();
+                  }).dimensions(this.width / 2 - W - 5, y + 96, W * 2 + 10, 20).build());
+
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Bitti"), btn -> this.close())
+                          .dimensions(this.width / 2 - 100, y + 132, 200, 20).build());
+              }
+
+              private static Text fpsLabel(BoostConfig c) {
+                  return Text.literal("Hedef FPS (Otomatik mod kapalıyken): " + c.targetFps);
+              }
+
+              private static Text label(String name, boolean on) {
+                  return Text.literal(name + ": " + (on ? "Açık" : "Kapalı"));
+              }
+
+              private void toggle(int x, int y, String name, BooleanSupplier get, Consumer<Boolean> set) {
+                  this.addDrawableChild(ButtonWidget.builder(label(name, get.getAsBoolean()), btn -> {
+                      set.accept(!get.getAsBoolean());
+                      btn.setMessage(label(name, get.getAsBoolean()));
+                      BoostConfig.save();
+                  }).dimensions(x, y, W, 20).build());
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  super.render(context, mouseX, mouseY, delta);
+                  context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 20, 0xFFFFFFFF);
+              }
+
+              @Override
+              public void close() {
+                  BoostConfig.save();
+                  if (this.client != null) this.client.setScreen(parent);
+              }
+          }
+          AB_EOF
+          mkdir -p src/main/java/com/autoboost
+          cat > src/main/java/com/autoboost/Optimizer.java <<'AB_EOF'
+          package com.autoboost;
+
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.ExperienceOrbEntity;
+          import net.minecraft.entity.ItemEntity;
+          import net.minecraft.entity.decoration.EndCrystalEntity;
+          import net.minecraft.entity.projectile.thrown.ExperienceBottleEntity;
+          import net.minecraft.entity.TntEntity;
+
+          public class Optimizer {
+              public static volatile boolean cullActive = false;
+              public static volatile double cullDistSq = 28 * 28;
+
+              // Patlama algılanınca birkaç saniyelik hızlı koruma
+              public static volatile long explosionUntil = 0;
+              public static final double EXPLOSION_CULL_SQ = 14 * 14;
+
+              // HUD için
+              public static volatile int fpsNow = 0;
+              public static volatile int fpsDelta = 0;
+              public static volatile int effectiveTarget = 60;
+
+              private static final int[] history = new int[30];
+              private static int histPos = 0, histCount = 0;
+              private static int lastFps = -1;
+
+              private static int ticks = 0;
+              private static long lastGc = 0;
+              private static boolean failed = false;
+
+              public static boolean explosionActive() {
+                  return System.currentTimeMillis() < explosionUntil;
+              }
+
+              public static void onExplosion() {
+                  try {
+                      BoostConfig c = BoostConfig.get();
+                      if (c.enabled && c.explosionBoost) {
+                          explosionUntil = System.currentTimeMillis() + 4000;
+                      }
+                  } catch (Throwable ignored) { }
+              }
+
+              /** Bu varlığın çizimi şu an atlanmalı mı? */
+              public static boolean shouldCull(Entity e, double x, double y, double z) {
+                  boolean exploding = explosionActive();
+                  if (!cullActive && !exploding) return false;
+                  double d = e.squaredDistanceTo(x, y, z);
+
+                  if (e instanceof TntEntity || e instanceof EndCrystalEntity) {
+                      // TNT/kristal: sadece patlama sırasında veya FPS çok düşükken, uzaktakiler
+                      return (exploding && d > EXPLOSION_CULL_SQ) || (cullActive && d > cullDistSq);
+                  }
+                  if (e instanceof ItemEntity || e instanceof ExperienceOrbEntity || e instanceof ExperienceBottleEntity) {
+                      double limit = exploding ? Math.min(cullDistSq, EXPLOSION_CULL_SQ) : cullDistSq;
+                      return d > limit;
+                  }
+                  return false;
+              }
+
+              public static void init() {
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (failed) return;
+                      if (++ticks < 20) return; // 20 tick = 1 saniye
+                      ticks = 0;
+                      try {
+                          run(client);
+                      } catch (Throwable t) {
+                          failed = true; // hata olursa kendini kapat, oyunu çökertme
+                          cullActive = false;
+                          AutoBoostMod.LOGGER.error("AutoBoost devre dışı bırakıldı", t);
+                      }
+                  });
+              }
+
+              private static void run(MinecraftClient mc) {
+                  BoostConfig cfg = BoostConfig.get();
+                  int fps = mc.getCurrentFps();
+
+                  // Saniye başı değişim (HUD)
+                  fpsDelta = lastFps < 0 ? 0 : fps - lastFps;
+                  lastFps = fps;
+                  fpsNow = fps;
+
+                  if (!cfg.enabled || mc.world == null) {
+                      cullActive = false;
+                      return;
+                  }
+
+                  // Son 30 saniyenin en yüksek FPS'i -> otomatik hedef
+                  history[histPos] = fps;
+                  histPos = (histPos + 1) % history.length;
+                  if (histCount < history.length) histCount++;
+                  int peak = 0;
+                  for (int i = 0; i < histCount; i++) peak = Math.max(peak, history[i]);
+
+                  double target = cfg.autoMode ? Math.max(60, peak * 0.85) : cfg.targetFps;
+                  effectiveTarget = (int) target;
+
+                  if (cfg.entityCulling) {
+                      if (fps < target * 0.5) { cullActive = true; cullDistSq = 10 * 10; }
+                      else if (fps < target * 0.7) { cullActive = true; cullDistSq = 16 * 16; }
+                      else if (fps < target) { cullActive = true; cullDistSq = 28 * 28; }
+                      else if (fps > target * 1.2) { cullActive = false; }
+                  } else {
+                      cullActive = false;
+                  }
+
+                  Runtime rt = Runtime.getRuntime();
+                  long used = rt.totalMemory() - rt.freeMemory();
+                  double ratio = (double) used / rt.maxMemory();
+
+                  // Bellek çok doluysa (çökme riski) çizimi ekstra azalt
+                  if (cfg.memoryGuard && ratio > 0.95 && cfg.entityCulling) {
+                      cullActive = true;
+                      cullDistSq = Math.min(cullDistSq, 12 * 12);
+                  }
+
+                  if (cfg.memoryGuard) {
+                      long now = System.currentTimeMillis();
+                      if (ratio > 0.92 && now - lastGc > 120_000) {
+                          lastGc = now;
+                          Thread th = new Thread(
